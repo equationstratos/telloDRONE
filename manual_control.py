@@ -38,12 +38,14 @@ class FrontEnd:
 
     def _battery_worker(self):
         while not self._stop_battery.is_set():
-            try:
-                val = self.tello.get_battery()
-                with self._battery_lock:
-                    self._battery = str(val).replace("\r\n", "")
-            except Exception:
-                pass
+            # Ne pas interroger la batterie pendant le vol — perturbe le firmware
+            if not self.send_rc_control:
+                try:
+                    val = self.tello.get_battery()
+                    with self._battery_lock:
+                        self._battery = str(val).replace("\r\n", "")
+                except Exception:
+                    pass
             self._stop_battery.wait(30)
 
     def _get_battery(self) -> str:
