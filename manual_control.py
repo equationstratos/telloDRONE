@@ -1,14 +1,3 @@
-"""
-Tello Manual Control — thread-safe + écran de chargement
-
-Corrections :
-  - Import local tello.py (ffmpeg subprocess, pas cv2.VideoCapture)
-  - _cmd_lock dans tello.py rend les commandes thread-safe (plus de crash à 30s)
-  - Écran de chargement pendant connexion et init ffmpeg
-  - Batterie en thread séparé (refresh 30s) — jamais bloquant
-  - FPS 30, clock.tick() non-bloquant
-"""
-
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -47,16 +36,6 @@ class FrontEnd:
 
         pygame.time.set_timer(pygame.USEREVENT + 1, 1000 // FPS)
 
-    def _show_loading(self, msg):
-        self.screen.fill((0, 0, 0))
-        surf = self.font.render(msg, True, (200, 200, 200))
-        self.screen.blit(surf, (20, 340))
-        pygame.display.update()
-        pygame.event.pump()
-
-    # ------------------------------------------------------------------
-    # Batterie en thread — ne bloque jamais la boucle vidéo
-    # ------------------------------------------------------------------
     def _battery_worker(self):
         while not self._stop_battery.is_set():
             try:
@@ -71,27 +50,15 @@ class FrontEnd:
         with self._battery_lock:
             return self._battery
 
-    # ------------------------------------------------------------------
     def run(self):
-        self._show_loading("Connexion au drone...")
         self.tello.connect()
         self.tello.set_speed(self.speed)
-
-        self._show_loading("Démarrage stream vidéo...")
         self.tello.streamoff()
         self.tello.streamon()
 
         frame_read = self.tello.get_frame_read()
 
-        # Thread batterie — démarre sans bloquer la boucle
         threading.Thread(target=self._battery_worker, daemon=True).start()
-
-        # Attente premier frame valide (max 12s)
-        self._show_loading("Initialisation ffmpeg — patientez...")
-        deadline = time.time() + 12
-        while not frame_read.grabbed and time.time() < deadline:
-            pygame.event.pump()
-            time.sleep(0.05)
 
         should_stop = False
         while not should_stop:
@@ -146,7 +113,6 @@ class FrontEnd:
         self.tello.end()
         pygame.quit()
 
-    # ------------------------------------------------------------------
     def keydown(self, key):
         if key == pygame.K_UP:
             self.for_back_velocity = S
@@ -175,11 +141,18 @@ class FrontEnd:
         elif key in (pygame.K_a, pygame.K_d):
             self.yaw_velocity = 0
         elif key == pygame.K_t:
-            self.tello.takeoff()
-            self.send_rc_control = True
+            # Takeoff dans un thread — ne bloque pas la boucle pygame/vidéo
+            threading.Thread(target=self._do_takeoff, daemon=True).start()
         elif key == pygame.K_l:
-            self.tello.land()
-            self.send_rc_control = False
+            threading.Thread(target=self._do_land, daemon=True).start()
+
+    def _do_takeoff(self):
+        self.tello.takeoff()
+        self.send_rc_control = True
+
+    def _do_land(self):
+        self.send_rc_control = False
+        self.tello.land()
 
     def update(self):
         if self.send_rc_control:
