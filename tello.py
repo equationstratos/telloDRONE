@@ -45,8 +45,10 @@ class Tello:
                 break
 
     def get_udp_video_address(self):
+        # fifo_size réduit à 500000 (était 5000000) — gros buffer = latence accumulée
+        # overrun_nonfatal=1 évite les crashes sur perte de paquets WiFi
         return ('udp://@' + self.VS_UDP_IP + ':' + str(self.VS_UDP_PORT)
-                + '?overrun_nonfatal=1&fifo_size=5000000')
+                + '?overrun_nonfatal=1&fifo_size=500000')
 
     def get_video_capture(self):
         if self.cap is None:
@@ -235,10 +237,16 @@ class BackgroundFrameRead:
     """Lit les frames vidéo en arrière-plan. Accède à .frame pour le dernier frame."""
 
     def __init__(self, tello, address):
-        tello.cap = cv2.VideoCapture(address)
+        # Forcer le backend FFmpeg — évite que Ubuntu 26 choisisse GStreamer
+        tello.cap = cv2.VideoCapture(address, cv2.CAP_FFMPEG)
         self.cap = tello.cap
+
+        # Réduire le buffer interne OpenCV à 1 frame → toujours le frame le plus récent
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         if not self.cap.isOpened():
             self.cap.open(address)
+
         self.grabbed, self.frame = self.cap.read()
         self.stopped = False
 
@@ -252,8 +260,7 @@ class BackgroundFrameRead:
                 self.stop()
             else:
                 self.grabbed, self.frame = self.cap.read()
-            # Micro-pause pour éviter 100% CPU sur ce thread
-            time.sleep(0.005)
+            # Pas de sleep ici — on lit aussi vite que possible pour vider le buffer
 
     def stop(self):
         self.stopped = True
