@@ -234,14 +234,17 @@ class Tello:
 
 
 class BackgroundFrameRead:
-    """Lit les frames vidéo en arrière-plan. Accède à .frame pour le dernier frame."""
+    """
+    Lit les frames vidéo en arrière-plan avec vidage actif du buffer.
+    Technique "frame dropper" : un thread draine en permanence le buffer
+    OpenCV/FFmpeg, un second thread expose uniquement le frame le plus récent.
+    Résultat : latence ~0 quelle que soit la vitesse de traitement du thread principal.
+    """
 
     def __init__(self, tello, address):
-        # Forcer le backend FFmpeg — évite que Ubuntu 26 choisisse GStreamer
+        # CAP_FFMPEG forcé — Ubuntu 26 peut choisir GStreamer par défaut
         tello.cap = cv2.VideoCapture(address, cv2.CAP_FFMPEG)
         self.cap = tello.cap
-
-        # Réduire le buffer interne OpenCV à 1 frame → toujours le frame le plus récent
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not self.cap.isOpened():
@@ -249,18 +252,38 @@ class BackgroundFrameRead:
 
         self.grabbed, self.frame = self.cap.read()
         self.stopped = False
+        self._lock = threading.Lock()
 
     def start(self):
+        # Thread unique qui draine le buffer aussi vite que possible
         Thread(target=self.update_frame, daemon=True).start()
         return self
 
     def update_frame(self):
         while not self.stopped:
-            if not self.grabbed or not self.cap.isOpened():
+            if not self.cap.isOpened():
                 self.stop()
-            else:
-                self.grabbed, self.frame = self.cap.read()
-            # Pas de sleep ici — on lit aussi vite que possible pour vider le buffer
+                break
+            grabbed, frame = self.cap.read()
+            if grabbed and frame is not None:
+                with self._lock:
+                    self.grabbed = grabbed
+                    self.frame   = frame
+            # Pas de sleep — on vide le buffer FFmpeg à la vitesse maximale
+
+    @property
+    def frame(self):
+        with self._lock:
+            return self._frame
+
+    @frame.setter
+    def frame(self, value):
+        # setter appelé directement au __init__ avant le lock existe
+        if hasattr(self, '_lock'):
+            with self._lock:
+                self._frame = value
+        else:
+            self._frame = value
 
     def stop(self):
         self.stopped = True
