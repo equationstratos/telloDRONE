@@ -33,12 +33,35 @@ class FrontEnd:
         self._battery = "?"
         self._battery_lock = threading.Lock()
         self._stop_battery = threading.Event()
+        self._stop_rc = threading.Event()
 
-        pygame.time.set_timer(pygame.USEREVENT + 1, 1000 // FPS)
+    # ------------------------------------------------------------------
+    # Heartbeat RC — thread dédié à 20Hz, DÉCOUPLÉ de pygame.
+    # C'est ce qui empêche l'atterrissage automatique : le Tello se pose
+    # tout seul s'il ne reçoit aucune commande pendant ~15s. Avant, le RC
+    # passait par le timer pygame, qui sautait des cycles quand la boucle
+    # vidéo bégayait → trou dans le heartbeat → atterrissage forcé.
+    # ------------------------------------------------------------------
+    def _rc_worker(self):
+        while not self._stop_rc.is_set():
+            if self.send_rc_control:
+                try:
+                    self.tello.send_rc_control(
+                        self.left_right_velocity,
+                        self.for_back_velocity,
+                        self.up_down_velocity,
+                        self.yaw_velocity,
+                    )
+                except Exception:
+                    pass
+            self._stop_rc.wait(0.05)  # 20Hz, cadence stable indépendante de l'affichage
 
+    # ------------------------------------------------------------------
+    # Batterie — thread séparé. Aucune lecture pendant le vol (perturbe
+    # la session SDK du firmware).
+    # ------------------------------------------------------------------
     def _battery_worker(self):
         while not self._stop_battery.is_set():
-            # Ne pas interroger la batterie pendant le vol — perturbe le firmware
             if not self.send_rc_control:
                 try:
                     val = self.tello.get_battery()
@@ -52,6 +75,7 @@ class FrontEnd:
         with self._battery_lock:
             return self._battery
 
+    # ------------------------------------------------------------------
     def run(self):
         self.tello.connect()
         self.tello.set_speed(self.speed)
@@ -61,14 +85,13 @@ class FrontEnd:
         frame_read = self.tello.get_frame_read()
 
         threading.Thread(target=self._battery_worker, daemon=True).start()
+        threading.Thread(target=self._rc_worker, daemon=True).start()
 
         should_stop = False
         while not should_stop:
 
             for event in pygame.event.get():
-                if event.type == pygame.USEREVENT + 1:
-                    self.update()
-                elif event.type == pygame.QUIT:
+                if event.type == pygame.QUIT:
                     should_stop = True
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
@@ -111,10 +134,12 @@ class FrontEnd:
             pygame.display.update()
             self.clock.tick(FPS)
 
+        self._stop_rc.set()
         self._stop_battery.set()
         self.tello.end()
         pygame.quit()
 
+    # ------------------------------------------------------------------
     def keydown(self, key):
         if key == pygame.K_UP:
             self.for_back_velocity = S
@@ -143,27 +168,20 @@ class FrontEnd:
         elif key in (pygame.K_a, pygame.K_d):
             self.yaw_velocity = 0
         elif key == pygame.K_t:
-            # Takeoff dans un thread — ne bloque pas la boucle pygame/vidéo
             threading.Thread(target=self._do_takeoff, daemon=True).start()
         elif key == pygame.K_l:
             threading.Thread(target=self._do_land, daemon=True).start()
 
     def _do_takeoff(self):
-        self.tello.takeoff()
+        # On arme le heartbeat AVANT le décollage : dès que le drone quitte
+        # le sol il reçoit déjà du RC, donc le contrôle répond immédiatement
+        # (plus d'attente des 5-7s de réponse "ok" du takeoff).
         self.send_rc_control = True
+        self.tello.takeoff()
 
     def _do_land(self):
         self.send_rc_control = False
         self.tello.land()
-
-    def update(self):
-        if self.send_rc_control:
-            self.tello.send_rc_control(
-                self.left_right_velocity,
-                self.for_back_velocity,
-                self.up_down_velocity,
-                self.yaw_velocity,
-            )
 
 
 def main():
