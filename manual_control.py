@@ -1,64 +1,116 @@
-from djitellopy import Tello
-
-import cv2
-import pygame
-import numpy as np
-import time
-import threading
+"""
+Tello Manual Control — standalone, zéro djitellopy, zéro cv2.VideoCapture
+"""
+import socket
 import subprocess
+import threading
+import time
 from threading import Thread
 
-S = 60
-FPS = 30
+import cv2
+import numpy as np
+import pygame
 
-# ----------------------------------------------------------------------
-# BackgroundFrameRead embarqué — ffmpeg subprocess, zéro cv2.VideoCapture.
-# On l'embarque ici pour ne pas dépendre de la version installée de
-# djitellopy qui utilise cv2.VideoCapture avec un timeout OpenCV de 30s
-# qui coupait le programme (et donc le drone) en plein vol.
-# ----------------------------------------------------------------------
-class FFmpegFrameRead:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tello SDK minimal — socket UDP brut, pas de djitellopy
+# ─────────────────────────────────────────────────────────────────────────────
+class TelloSDK:
+    IP   = '192.168.10.1'
+    PORT = 8889
+    TIMEOUT = 7  # secondes
+
+    def __init__(self):
+        self._addr = (self.IP, self.PORT)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(('', self.PORT))
+        self._sock.settimeout(self.TIMEOUT)
+        self._lock = threading.Lock()  # sérialise les commandes avec retour
+
+    def _cmd(self, text: str) -> str:
+        """Envoie une commande et attend la réponse — thread-safe."""
+        with self._lock:
+            print('Send:', text)
+            self._sock.sendto(text.encode(), self._addr)
+            try:
+                data, _ = self._sock.recvfrom(1024)
+                resp = data.decode().strip()
+                print('Recv:', resp)
+                return resp
+            except socket.timeout:
+                print('Timeout:', text)
+                return 'timeout'
+
+    def _send(self, text: str):
+        """Envoie sans attendre de réponse (rc — feu-et-oubli)."""
+        self._sock.sendto(text.encode(), self._addr)
+
+    def connect(self):     return self._cmd('command')  in ('ok', 'OK')
+    def takeoff(self):     return self._cmd('takeoff')  in ('ok', 'OK')
+    def land(self):        return self._cmd('land')     in ('ok', 'OK')
+    def streamon(self):    return self._cmd('streamon') in ('ok', 'OK')
+    def streamoff(self):   return self._cmd('streamoff') in ('ok', 'OK')
+    def set_speed(self, v): return self._cmd(f'speed {v}') in ('ok', 'OK')
+
+    def battery(self) -> str:
+        r = self._cmd('battery?').replace('\r\n', '').strip()
+        return r if r.isdigit() else '?'
+
+    def rc(self, lr: int, fb: int, ud: int, yaw: int):
+        self._send(f'rc {lr} {fb} {ud} {yaw}')
+
+    def close(self):
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Flux vidéo via ffmpeg subprocess — pas de cv2.VideoCapture, pas de timeout
+# ─────────────────────────────────────────────────────────────────────────────
+class VideoStream:
     W, H = 960, 720
+    URL  = 'udp://@0.0.0.0:11111?overrun_nonfatal=1&fifo_size=500000&reuse=1'
 
-    def __init__(self, address):
-        self.address = address
+    def __init__(self):
         self._lock  = threading.Lock()
         self._frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-        self.grabbed = False
-        self.stopped = False
         self._proc  = None
+        self._stop  = False
 
-    def _start_ffmpeg(self):
+    def _launch(self):
         subprocess.run(['pkill', '-f', 'ffmpeg.*11111'], capture_output=True)
-        time.sleep(0.2)
+        time.sleep(0.3)
         cmd = [
             'ffmpeg',
-            '-loglevel', 'quiet',          # silence les warnings h264
+            '-loglevel', 'error',
             '-fflags', 'nobuffer',
             '-flags', 'low_delay',
-            '-analyzeduration', '0',
-            '-probesize', '32',
-            '-i', self.address,
+            '-i', self.URL,
             '-f', 'rawvideo',
             '-pix_fmt', 'bgr24',
             '-vf', f'scale={self.W}:{self.H}',
             '-vsync', '0',
-            '-'
+            '-',
         ]
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL, bufsize=0)
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=None, bufsize=0
+        )
+        print(f'[VIDEO] ffmpeg PID={self._proc.pid}')
 
     def start(self):
-        self._start_ffmpeg()
-        Thread(target=self._update, daemon=True).start()
+        self._launch()
+        Thread(target=self._read, daemon=True).start()
         return self
 
-    def _update(self):
+    def _read(self):
         size = self.W * self.H * 3
-        while not self.stopped:
+        while not self._stop:
             if self._proc is None or self._proc.poll() is not None:
+                print('[VIDEO] ffmpeg terminé, relance...')
                 time.sleep(1)
-                self._start_ffmpeg()
+                self._launch()
                 continue
             try:
                 raw = self._proc.stdout.read(size)
@@ -68,181 +120,167 @@ class FFmpegFrameRead:
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.H, self.W, 3))
                 with self._lock:
                     self._frame = frame
-                    self.grabbed = True
 
     @property
-    def frame(self):
+    def frame(self) -> np.ndarray:
         with self._lock:
             return self._frame.copy()
 
     def stop(self):
-        self.stopped = True
+        self._stop = True
         if self._proc:
             self._proc.terminate()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Interface principale
+# ─────────────────────────────────────────────────────────────────────────────
+S   = 60   # vitesse RC
+FPS = 30
 
 
 class FrontEnd:
     def __init__(self):
         pygame.init()
-        pygame.display.set_caption("Tello — Contrôle manuel")
+        pygame.display.set_caption('Tello — Contrôle manuel')
         self.screen = pygame.display.set_mode([960, 720])
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Arial", 20)
+        self.clock  = pygame.time.Clock()
+        self.font   = pygame.font.SysFont('Arial', 20)
 
-        self.tello = Tello()
+        self.drone = TelloSDK()
+        self.video = VideoStream()
 
-        self.for_back_velocity = 0
-        self.left_right_velocity = 0
-        self.up_down_velocity = 0
-        self.yaw_velocity = 0
-        self.speed = 10
-        self.send_rc_control = False
+        # Vélocités RC courantes
+        self.lr = self.fb = self.ud = self.yaw = 0
+        self.flying = False
 
-        self._battery = "?"
-        self._battery_lock = threading.Lock()
-        self._stop_battery = threading.Event()
-        self._stop_rc = threading.Event()
+        # Batterie
+        self._bat      = '?'
+        self._bat_lock = threading.Lock()
+        self._stop_ev  = threading.Event()
 
-    # ------------------------------------------------------------------
-    # Heartbeat RC dédié — 20Hz, indépendant de pygame
-    # ------------------------------------------------------------------
-    def _rc_worker(self):
-        while not self._stop_rc.is_set():
-            if self.send_rc_control:
+    # ── threads ──────────────────────────────────────────────────────────────
+
+    def _rc_thread(self):
+        """Heartbeat RC à 20 Hz, indépendant de pygame."""
+        while not self._stop_ev.is_set():
+            if self.flying:
                 try:
-                    self.tello.send_rc_control(
-                        self.left_right_velocity,
-                        self.for_back_velocity,
-                        self.up_down_velocity,
-                        self.yaw_velocity,
-                    )
+                    self.drone.rc(self.lr, self.fb, self.ud, self.yaw)
+                except Exception as e:
+                    print('[RC erreur]', e)
+            self._stop_ev.wait(0.05)
+
+    def _bat_thread(self):
+        """Lecture batterie toutes les 30s hors vol."""
+        while not self._stop_ev.is_set():
+            if not self.flying:
+                try:
+                    v = self.drone.battery()
+                    with self._bat_lock:
+                        self._bat = v
                 except Exception:
                     pass
-            self._stop_rc.wait(0.05)
+            self._stop_ev.wait(30)
 
-    def _battery_worker(self):
-        while not self._stop_battery.is_set():
-            if not self.send_rc_control:
-                try:
-                    val = self.tello.get_battery()
-                    with self._battery_lock:
-                        self._battery = str(val).replace("\r\n", "")
-                except Exception:
-                    pass
-            self._stop_battery.wait(30)
+    def _get_bat(self) -> str:
+        with self._bat_lock:
+            return self._bat
 
-    def _get_battery(self) -> str:
-        with self._battery_lock:
-            return self._battery
+    # ── commandes vol (threads séparés — ne bloquent pas pygame) ─────────────
 
-    # ------------------------------------------------------------------
+    def _do_takeoff(self):
+        self.flying = True      # heartbeat armé avant le décollage
+        self.drone.takeoff()
+
+    def _do_land(self):
+        self.flying = False
+        self.drone.land()
+
+    # ── boucle principale ────────────────────────────────────────────────────
+
     def run(self):
-        self.tello.connect()
-        self.tello.set_speed(self.speed)
-        self.tello.streamoff()
-        self.tello.streamon()
+        print('[INIT] connexion au drone...')
+        self.drone.connect()
+        self.drone.set_speed(10)
+        self.drone.streamoff()
+        self.drone.streamon()
 
-        udp = ('udp://@0.0.0.0:11111'
-               '?overrun_nonfatal=1&fifo_size=500000&reuse=1')
-        frame_read = FFmpegFrameRead(udp).start()
+        self.video.start()
 
-        threading.Thread(target=self._battery_worker, daemon=True).start()
-        threading.Thread(target=self._rc_worker, daemon=True).start()
+        Thread(target=self._rc_thread,  daemon=True).start()
+        Thread(target=self._bat_thread, daemon=True).start()
 
-        should_stop = False
-        while not should_stop:
+        print('[INIT] prêt — T:décollage  L:atterrissage  ESCAPE:quitter')
 
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    should_stop = True
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        should_stop = True
+        running = True
+        while running:
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    running = False
+                elif ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE:
+                        running = False
                     else:
-                        self.keydown(event.key)
-                elif event.type == pygame.KEYUP:
-                    self.keyup(event.key)
+                        self._keydown(ev.key)
+                elif ev.type == pygame.KEYUP:
+                    self._keyup(ev.key)
 
+            # Rendu vidéo — le programme ne s'arrête JAMAIS à cause de la vidéo
             self.screen.fill((0, 0, 0))
-
             try:
-                raw = frame_read.frame
-                frame = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
-                frame = np.rot90(frame)
-                frame = np.flipud(frame)
-                surf = pygame.surfarray.make_surface(frame)
+                bgr  = self.video.frame
+                rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                surf = pygame.surfarray.make_surface(
+                    np.ascontiguousarray(np.flipud(np.rot90(rgb)))
+                )
                 self.screen.blit(surf, (0, 0))
             except Exception:
-                pass  # flux vidéo temporairement indisponible — on continue
+                pass
 
-            bat_text = f"Batterie : {self._get_battery()}%"
-            bat_surf = self.font.render(bat_text, True, (0, 255, 80))
-            self.screen.blit(bat_surf, (10, 10))
-
-            controls = [
-                "T : Décollage   L : Atterrissage",
-                "↑↓←→ : Avant/Arrière/Gauche/Droite",
-                "W/S : Monter/Descendre   A/D : Rotation",
-                "ESCAPE : Quitter",
+            # HUD
+            hud = [
+                (f'Batterie : {self._get_bat()}%', (0, 255, 80),  (10, 10)),
+                ('T:Décollage  L:Atterrissage',    (200,200,200), (10, 650)),
+                ('↑↓←→:Avancer  W/S:Haut/Bas  A/D:Rotation', (200,200,200), (10, 672)),
+                ('ESCAPE:Quitter',                 (200,200,200), (10, 694)),
             ]
-            for i, line in enumerate(controls):
-                surf_c = self.font.render(line, True, (200, 200, 200))
-                self.screen.blit(surf_c, (10, 680 - (len(controls) - i) * 22))
+            for text, color, pos in hud:
+                self.screen.blit(self.font.render(text, True, color), pos)
 
             pygame.display.update()
             self.clock.tick(FPS)
 
-        self._stop_rc.set()
-        self._stop_battery.set()
-        frame_read.stop()
-        self.tello.end()
+        # Nettoyage
+        self._stop_ev.set()
+        self.video.stop()
+        try:
+            self.drone.streamoff()
+        except Exception:
+            pass
+        self.drone.close()
         pygame.quit()
 
-    # ------------------------------------------------------------------
-    def keydown(self, key):
-        if key == pygame.K_UP:
-            self.for_back_velocity = S
-        elif key == pygame.K_DOWN:
-            self.for_back_velocity = -S
-        elif key == pygame.K_LEFT:
-            self.left_right_velocity = -S
-        elif key == pygame.K_RIGHT:
-            self.left_right_velocity = S
-        elif key == pygame.K_w:
-            self.up_down_velocity = S
-        elif key == pygame.K_s:
-            self.up_down_velocity = -S
-        elif key == pygame.K_a:
-            self.yaw_velocity = -S
-        elif key == pygame.K_d:
-            self.yaw_velocity = S
+    def _keydown(self, key):
+        if   key == pygame.K_UP:    self.fb  =  S
+        elif key == pygame.K_DOWN:  self.fb  = -S
+        elif key == pygame.K_LEFT:  self.lr  = -S
+        elif key == pygame.K_RIGHT: self.lr  =  S
+        elif key == pygame.K_w:     self.ud  =  S
+        elif key == pygame.K_s:     self.ud  = -S
+        elif key == pygame.K_a:     self.yaw = -S
+        elif key == pygame.K_d:     self.yaw =  S
 
-    def keyup(self, key):
-        if key in (pygame.K_UP, pygame.K_DOWN):
-            self.for_back_velocity = 0
-        elif key in (pygame.K_LEFT, pygame.K_RIGHT):
-            self.left_right_velocity = 0
-        elif key in (pygame.K_w, pygame.K_s):
-            self.up_down_velocity = 0
-        elif key in (pygame.K_a, pygame.K_d):
-            self.yaw_velocity = 0
+    def _keyup(self, key):
+        if   key in (pygame.K_UP,    pygame.K_DOWN):  self.fb  = 0
+        elif key in (pygame.K_LEFT,  pygame.K_RIGHT):  self.lr  = 0
+        elif key in (pygame.K_w,     pygame.K_s):      self.ud  = 0
+        elif key in (pygame.K_a,     pygame.K_d):      self.yaw = 0
         elif key == pygame.K_t:
-            threading.Thread(target=self._do_takeoff, daemon=True).start()
+            Thread(target=self._do_takeoff, daemon=True).start()
         elif key == pygame.K_l:
-            threading.Thread(target=self._do_land, daemon=True).start()
-
-    def _do_takeoff(self):
-        self.send_rc_control = True
-        self.tello.takeoff()
-
-    def _do_land(self):
-        self.send_rc_control = False
-        self.tello.land()
+            Thread(target=self._do_land, daemon=True).start()
 
 
-def main():
+if __name__ == '__main__':
     FrontEnd().run()
-
-
-if __name__ == "__main__":
-    main()
