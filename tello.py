@@ -2,6 +2,8 @@
 import socket
 import time
 import threading
+import subprocess
+import numpy as np
 import cv2
 from threading import Thread
 from djitellopy.decorators import accepts
@@ -245,64 +247,80 @@ class Tello:
 
 class BackgroundFrameRead:
     """
-    Lit les frames vidéo en arrière-plan avec vidage actif du buffer.
-    Technique "frame dropper" : un thread draine en permanence le buffer
-    OpenCV/FFmpeg, un second thread expose uniquement le frame le plus récent.
-    Résultat : latence ~0 quelle que soit la vitesse de traitement du thread principal.
+    Lit le stream H264 du Tello via ffmpeg subprocess directement.
+
+    Bypasse complètement cv2.VideoCapture dont le buffering sur Ubuntu 26
+    cause 20-30s de latence. Les flags nobuffer+low_delay de FFmpeg donnent
+    une latence < 200ms dès le démarrage.
     """
 
+    W, H = 960, 720  # résolution Tello
+
     def __init__(self, tello, address):
-        # Essaie GStreamer en premier (meilleure latence sur Ubuntu 26+)
-        # Si GStreamer non disponible, repli sur FFmpeg
-        gst = tello.get_gstreamer_pipeline()
-        cap_gst = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-        if cap_gst.isOpened():
-            print("[VIDEO] Backend : GStreamer (bas-latence)")
-            tello.cap = cap_gst
-        else:
-            print("[VIDEO] Backend : FFmpeg (GStreamer indisponible)")
-            cap_gst.release()
-            tello.cap = cv2.VideoCapture(address, cv2.CAP_FFMPEG)
-            tello.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        self.cap = tello.cap
-        if not self.cap.isOpened():
-            self.cap.open(address)
-
-        self.grabbed, self.frame = self.cap.read()
+        tello.cap = None  # pas de VideoCapture OpenCV
+        self.address = address
+        self._lock   = threading.Lock()
+        self._frame  = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+        self.grabbed = False
         self.stopped = False
-        self._lock = threading.Lock()
+        self._proc   = None
+
+    def _start_ffmpeg(self):
+        cmd = [
+            'ffmpeg',
+            '-loglevel', 'quiet',
+            # Flags bas-latence — indisponibles via cv2.VideoCapture
+            '-fflags', 'nobuffer+discardcorrupt',
+            '-flags', 'low_delay',
+            '-avioflags', 'direct',
+            '-analyzeduration', '0',
+            '-probesize', '32',
+            '-i', self.address,
+            # Sortie rawvideo BGR (format natif OpenCV/numpy)
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-vf', f'scale={self.W}:{self.H}',
+            '-vsync', '0',
+            '-'
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0  # pas de buffer Python côté lecture
+        )
+        print("[VIDEO] Backend : ffmpeg subprocess (bas-latence forcé)")
 
     def start(self):
-        # Thread unique qui draine le buffer aussi vite que possible
+        self._start_ffmpeg()
         Thread(target=self.update_frame, daemon=True).start()
         return self
 
     def update_frame(self):
+        frame_size = self.W * self.H * 3
         while not self.stopped:
-            if not self.cap.isOpened():
-                self.stop()
-                break
-            grabbed, frame = self.cap.read()
-            if grabbed and frame is not None:
+            if self._proc is None or self._proc.poll() is not None:
+                # ffmpeg s'est arrêté — on tente de relancer
+                print("[VIDEO] ffmpeg arrêté, relance...")
+                time.sleep(1)
+                self._start_ffmpeg()
+                continue
+            raw = self._proc.stdout.read(frame_size)
+            if len(raw) == frame_size:
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.H, self.W, 3))
                 with self._lock:
-                    self.grabbed = grabbed
-                    self.frame   = frame
-            # Pas de sleep — on vide le buffer FFmpeg à la vitesse maximale
+                    self._frame  = frame
+                    self.grabbed = True
 
     @property
     def frame(self):
         with self._lock:
-            return self._frame
+            return self._frame.copy()
 
-    @frame.setter
-    def frame(self, value):
-        # setter appelé directement au __init__ avant le lock existe
-        if hasattr(self, '_lock'):
-            with self._lock:
-                self._frame = value
-        else:
-            self._frame = value
+    def stop(self):
+        self.stopped = True
+        if self._proc:
+            self._proc.terminate()
 
     def stop(self):
         self.stopped = True
