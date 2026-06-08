@@ -48,7 +48,7 @@ class Tello:
 
     def get_udp_video_address(self):
         return ('udp://@' + self.VS_UDP_IP + ':' + str(self.VS_UDP_PORT)
-                + '?overrun_nonfatal=1&fifo_size=500000')
+                + '?overrun_nonfatal=1&fifo_size=500000&reuse=1')
 
     def get_gstreamer_pipeline(self):
         # Pipeline GStreamer bas-latence pour Ubuntu 26+
@@ -266,6 +266,8 @@ class BackgroundFrameRead:
         self._proc   = None
 
     def _start_ffmpeg(self):
+        subprocess.run(['pkill', '-f', 'ffmpeg.*11111'], capture_output=True)
+        time.sleep(0.3)
         cmd = [
             'ffmpeg',
             '-loglevel', 'error',          # affiche les erreurs dans le terminal
@@ -318,6 +320,3 @@ class BackgroundFrameRead:
         self.stopped = True
         if self._proc:
             self._proc.terminate()
-
-    def stop(self):
-        self.stopped = True
