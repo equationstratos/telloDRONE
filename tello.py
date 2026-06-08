@@ -45,10 +45,20 @@ class Tello:
                 break
 
     def get_udp_video_address(self):
-        # fifo_size réduit à 500000 (était 5000000) — gros buffer = latence accumulée
-        # overrun_nonfatal=1 évite les crashes sur perte de paquets WiFi
         return ('udp://@' + self.VS_UDP_IP + ':' + str(self.VS_UDP_PORT)
                 + '?overrun_nonfatal=1&fifo_size=500000')
+
+    def get_gstreamer_pipeline(self):
+        # Pipeline GStreamer bas-latence pour Ubuntu 26+
+        # max-buffers=1 drop=true : jette les vieux frames, garde uniquement le plus récent
+        # sync=false : pas de sync horloge → zéro délai artificiel
+        return (
+            f'udpsrc port={self.VS_UDP_PORT} '
+            '! h264parse '
+            '! avdec_h264 max-threads=2 '
+            '! videoconvert '
+            '! appsink max-buffers=1 drop=true sync=false'
+        )
 
     def get_video_capture(self):
         if self.cap is None:
@@ -242,11 +252,20 @@ class BackgroundFrameRead:
     """
 
     def __init__(self, tello, address):
-        # CAP_FFMPEG forcé — Ubuntu 26 peut choisir GStreamer par défaut
-        tello.cap = cv2.VideoCapture(address, cv2.CAP_FFMPEG)
-        self.cap = tello.cap
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Essaie GStreamer en premier (meilleure latence sur Ubuntu 26+)
+        # Si GStreamer non disponible, repli sur FFmpeg
+        gst = tello.get_gstreamer_pipeline()
+        cap_gst = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+        if cap_gst.isOpened():
+            print("[VIDEO] Backend : GStreamer (bas-latence)")
+            tello.cap = cap_gst
+        else:
+            print("[VIDEO] Backend : FFmpeg (GStreamer indisponible)")
+            cap_gst.release()
+            tello.cap = cv2.VideoCapture(address, cv2.CAP_FFMPEG)
+            tello.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+        self.cap = tello.cap
         if not self.cap.isOpened():
             self.cap.open(address)
 
