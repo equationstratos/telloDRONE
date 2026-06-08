@@ -1,5 +1,7 @@
 import sys
 import os
+import glob
+import subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tello import Tello
 
@@ -11,6 +13,43 @@ import threading
 
 S = 60
 FPS = 30
+
+BANNER = "=== manual_control v4 — heartbeat thread + diagnostic ==="
+
+
+# ----------------------------------------------------------------------
+# Diagnostic WiFi : le power-save d'Ubuntu 26 retarde/jette les petits
+# paquets de commande (rc) tout en laissant passer la vidéo bufferisée.
+# C'est le suspect nº1 de l'atterrissage automatique.
+# ----------------------------------------------------------------------
+def find_wifi_iface():
+    for path in glob.glob('/sys/class/net/*/wireless'):
+        return path.split('/')[-2]
+    return None
+
+
+def check_power_save(iface):
+    try:
+        out = subprocess.run(['iw', 'dev', iface, 'get', 'power_save'],
+                             capture_output=True, text=True, timeout=3)
+        return 'on' in out.stdout.lower()
+    except Exception:
+        return None
+
+
+def warn_power_save():
+    iface = find_wifi_iface()
+    if not iface:
+        return
+    state = check_power_save(iface)
+    if state is True:
+        print("\n" + "!" * 60)
+        print(f"  POWER-SAVE WIFI ACTIF sur {iface} — cause probable de")
+        print("  l'atterrissage automatique. Désactive-le AVANT de voler :")
+        print(f"     sudo iw dev {iface} set power_save off")
+        print("!" * 60 + "\n")
+    elif state is False:
+        print(f"[WiFi] power-save déjà désactivé sur {iface} — OK")
 
 
 class FrontEnd:
@@ -35,12 +74,11 @@ class FrontEnd:
         self._stop_battery = threading.Event()
         self._stop_rc = threading.Event()
 
+        self._rc_count = 0          # diagnostic : nb de rc envoyés
+        self._takeoff_time = None   # horodatage du décollage
+
     # ------------------------------------------------------------------
     # Heartbeat RC — thread dédié à 20Hz, DÉCOUPLÉ de pygame.
-    # C'est ce qui empêche l'atterrissage automatique : le Tello se pose
-    # tout seul s'il ne reçoit aucune commande pendant ~15s. Avant, le RC
-    # passait par le timer pygame, qui sautait des cycles quand la boucle
-    # vidéo bégayait → trou dans le heartbeat → atterrissage forcé.
     # ------------------------------------------------------------------
     def _rc_worker(self):
         while not self._stop_rc.is_set():
@@ -52,13 +90,11 @@ class FrontEnd:
                         self.up_down_velocity,
                         self.yaw_velocity,
                     )
-                except Exception:
-                    pass
-            self._stop_rc.wait(0.05)  # 20Hz, cadence stable indépendante de l'affichage
+                    self._rc_count += 1
+                except Exception as e:
+                    print("[RC] erreur:", e)
+            self._stop_rc.wait(0.05)
 
-    # ------------------------------------------------------------------
-    # Batterie — thread séparé. Aucune lecture pendant le vol (perturbe
-    # la session SDK du firmware).
     # ------------------------------------------------------------------
     def _battery_worker(self):
         while not self._stop_battery.is_set():
@@ -77,6 +113,9 @@ class FrontEnd:
 
     # ------------------------------------------------------------------
     def run(self):
+        print(BANNER)
+        warn_power_save()
+
         self.tello.connect()
         self.tello.set_speed(self.speed)
         self.tello.streamoff()
@@ -86,6 +125,10 @@ class FrontEnd:
 
         threading.Thread(target=self._battery_worker, daemon=True).start()
         threading.Thread(target=self._rc_worker, daemon=True).start()
+
+        # Diagnostic : affiche l'état du heartbeat 1×/seconde
+        last_diag = time.time()
+        last_count = 0
 
         should_stop = False
         while not should_stop:
@@ -103,6 +146,17 @@ class FrontEnd:
 
             if frame_read.stopped:
                 break
+
+            # Diagnostic 1×/s — montre si le heartbeat tourne quand le drone se pose
+            now = time.time()
+            if now - last_diag >= 1.0:
+                rc_per_sec = self._rc_count - last_count
+                last_count = self._rc_count
+                last_diag = now
+                if self._takeoff_time:
+                    vol_t = int(now - self._takeoff_time)
+                    print(f"[vol {vol_t:>3}s] rc/s={rc_per_sec:>2}  "
+                          f"send_rc={self.send_rc_control}  bat={self._get_battery()}")
 
             raw = frame_read.frame
             if raw is None:
@@ -173,14 +227,18 @@ class FrontEnd:
             threading.Thread(target=self._do_land, daemon=True).start()
 
     def _do_takeoff(self):
-        # On arme le heartbeat AVANT le décollage : dès que le drone quitte
-        # le sol il reçoit déjà du RC, donc le contrôle répond immédiatement
-        # (plus d'attente des 5-7s de réponse "ok" du takeoff).
+        # Heartbeat armé AVANT le décollage → contrôle réactif dès l'envol.
+        # Note : le Tello ignore le rc pendant ~3-5s (routine de stabilisation
+        # interne du décollage) — ce court délai est normal et incompressible.
         self.send_rc_control = True
+        self._takeoff_time = time.time()
+        print("[TAKEOFF] décollage + stabilisation (~5s)...")
         self.tello.takeoff()
+        print("[TAKEOFF] terminé, contrôle manuel actif")
 
     def _do_land(self):
         self.send_rc_control = False
+        self._takeoff_time = None
         self.tello.land()
 
 
