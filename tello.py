@@ -33,6 +33,7 @@ class Tello:
         self.stream_on = False
         self._last_command_time = 0       # en secondes
         self._last_rc_sent_ms = 0         # en millisecondes
+        self._cmd_lock = threading.Lock() # sérialise les commandes (thread-safe)
 
         thread = threading.Thread(target=self.run_udp_receiver, args=())
         thread.daemon = True
@@ -81,30 +82,29 @@ class Tello:
 
     @accepts(command=str)
     def send_command_with_return(self, command):
-        """Envoie une commande et attend la réponse."""
-        # Respect du délai minimum entre commandes
-        elapsed = time.time() - self._last_command_time
-        if elapsed < self.TIME_BTW_COMMANDS:
-            time.sleep(self.TIME_BTW_COMMANDS - elapsed)
+        """Envoie une commande et attend la réponse — thread-safe via _cmd_lock."""
+        with self._cmd_lock:
+            elapsed = time.time() - self._last_command_time
+            if elapsed < self.TIME_BTW_COMMANDS:
+                time.sleep(self.TIME_BTW_COMMANDS - elapsed)
 
-        print('Send command: ' + command)
-        self.response = None
-        self.clientSocket.sendto(command.encode('utf-8'), self.address)
-        deadline = time.time() + self.RESPONSE_TIMEOUT
+            print('Send command: ' + command)
+            self.response = None
+            self.clientSocket.sendto(command.encode('utf-8'), self.address)
+            deadline = time.time() + self.RESPONSE_TIMEOUT
 
-        # Attente non-bloquante avec micro-sleep (évite 100% CPU)
-        while self.response is None:
-            if time.time() > deadline:
-                print('Timeout exceeded on command: ' + command)
-                return False
-            time.sleep(0.001)  # libère le CPU — était une busy loop pure
+            while self.response is None:
+                if time.time() > deadline:
+                    print('Timeout exceeded on command: ' + command)
+                    return False
+                time.sleep(0.001)
 
-        response = self.response.decode('utf-8')
-        self.response = None
-        self._last_command_time = time.time()
+            response = self.response.decode('utf-8')
+            self.response = None
+            self._last_command_time = time.time()
 
-        print('Response: ' + response)
-        return response
+            print('Response: ' + response)
+            return response
 
     @accepts(command=str)
     def send_command_without_return(self, command):
