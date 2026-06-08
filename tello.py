@@ -268,15 +268,12 @@ class BackgroundFrameRead:
     def _start_ffmpeg(self):
         cmd = [
             'ffmpeg',
-            '-loglevel', 'quiet',
-            # Flags bas-latence — indisponibles via cv2.VideoCapture
-            '-fflags', 'nobuffer+discardcorrupt',
+            '-loglevel', 'error',          # affiche les erreurs dans le terminal
+            '-fflags', 'nobuffer',
             '-flags', 'low_delay',
-            '-avioflags', 'direct',
             '-analyzeduration', '0',
             '-probesize', '32',
             '-i', self.address,
-            # Sortie rawvideo BGR (format natif OpenCV/numpy)
             '-f', 'rawvideo',
             '-pix_fmt', 'bgr24',
             '-vf', f'scale={self.W}:{self.H}',
@@ -286,10 +283,10 @@ class BackgroundFrameRead:
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0  # pas de buffer Python côté lecture
+            stderr=None,   # laisse stderr passer dans le terminal pour debug
+            bufsize=0
         )
-        print("[VIDEO] Backend : ffmpeg subprocess (bas-latence forcé)")
+        print(f"[VIDEO] ffmpeg lancé (PID {self._proc.pid}) — adresse : {self.address}")
 
     def start(self):
         self._start_ffmpeg()
