@@ -1,7 +1,5 @@
 import sys
 import os
-import glob
-import subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tello import Tello
 
@@ -10,46 +8,80 @@ import pygame
 import numpy as np
 import time
 import threading
+import subprocess
+from threading import Thread
 
 S = 60
 FPS = 30
 
-BANNER = "=== manual_control v4 — heartbeat thread + diagnostic ==="
-
-
 # ----------------------------------------------------------------------
-# Diagnostic WiFi : le power-save d'Ubuntu 26 retarde/jette les petits
-# paquets de commande (rc) tout en laissant passer la vidéo bufferisée.
-# C'est le suspect nº1 de l'atterrissage automatique.
+# BackgroundFrameRead embarqué — ffmpeg subprocess, zéro cv2.VideoCapture.
+# On l'embarque ici pour ne pas dépendre de la version installée de
+# djitellopy qui utilise cv2.VideoCapture avec un timeout OpenCV de 30s
+# qui coupait le programme (et donc le drone) en plein vol.
 # ----------------------------------------------------------------------
-def find_wifi_iface():
-    for path in glob.glob('/sys/class/net/*/wireless'):
-        return path.split('/')[-2]
-    return None
+class FFmpegFrameRead:
+    W, H = 960, 720
 
+    def __init__(self, address):
+        self.address = address
+        self._lock  = threading.Lock()
+        self._frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+        self.grabbed = False
+        self.stopped = False
+        self._proc  = None
 
-def check_power_save(iface):
-    try:
-        out = subprocess.run(['iw', 'dev', iface, 'get', 'power_save'],
-                             capture_output=True, text=True, timeout=3)
-        return 'on' in out.stdout.lower()
-    except Exception:
-        return None
+    def _start_ffmpeg(self):
+        subprocess.run(['pkill', '-f', 'ffmpeg.*11111'], capture_output=True)
+        time.sleep(0.2)
+        cmd = [
+            'ffmpeg',
+            '-loglevel', 'quiet',          # silence les warnings h264
+            '-fflags', 'nobuffer',
+            '-flags', 'low_delay',
+            '-analyzeduration', '0',
+            '-probesize', '32',
+            '-i', self.address,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-vf', f'scale={self.W}:{self.H}',
+            '-vsync', '0',
+            '-'
+        ]
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, bufsize=0)
 
+    def start(self):
+        self._start_ffmpeg()
+        Thread(target=self._update, daemon=True).start()
+        return self
 
-def warn_power_save():
-    iface = find_wifi_iface()
-    if not iface:
-        return
-    state = check_power_save(iface)
-    if state is True:
-        print("\n" + "!" * 60)
-        print(f"  POWER-SAVE WIFI ACTIF sur {iface} — cause probable de")
-        print("  l'atterrissage automatique. Désactive-le AVANT de voler :")
-        print(f"     sudo iw dev {iface} set power_save off")
-        print("!" * 60 + "\n")
-    elif state is False:
-        print(f"[WiFi] power-save déjà désactivé sur {iface} — OK")
+    def _update(self):
+        size = self.W * self.H * 3
+        while not self.stopped:
+            if self._proc is None or self._proc.poll() is not None:
+                time.sleep(1)
+                self._start_ffmpeg()
+                continue
+            try:
+                raw = self._proc.stdout.read(size)
+            except Exception:
+                continue
+            if len(raw) == size:
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.H, self.W, 3))
+                with self._lock:
+                    self._frame = frame
+                    self.grabbed = True
+
+    @property
+    def frame(self):
+        with self._lock:
+            return self._frame.copy()
+
+    def stop(self):
+        self.stopped = True
+        if self._proc:
+            self._proc.terminate()
 
 
 class FrontEnd:
@@ -74,11 +106,8 @@ class FrontEnd:
         self._stop_battery = threading.Event()
         self._stop_rc = threading.Event()
 
-        self._rc_count = 0          # diagnostic : nb de rc envoyés
-        self._takeoff_time = None   # horodatage du décollage
-
     # ------------------------------------------------------------------
-    # Heartbeat RC — thread dédié à 20Hz, DÉCOUPLÉ de pygame.
+    # Heartbeat RC dédié — 20Hz, indépendant de pygame
     # ------------------------------------------------------------------
     def _rc_worker(self):
         while not self._stop_rc.is_set():
@@ -90,12 +119,10 @@ class FrontEnd:
                         self.up_down_velocity,
                         self.yaw_velocity,
                     )
-                    self._rc_count += 1
-                except Exception as e:
-                    print("[RC] erreur:", e)
+                except Exception:
+                    pass
             self._stop_rc.wait(0.05)
 
-    # ------------------------------------------------------------------
     def _battery_worker(self):
         while not self._stop_battery.is_set():
             if not self.send_rc_control:
@@ -113,22 +140,17 @@ class FrontEnd:
 
     # ------------------------------------------------------------------
     def run(self):
-        print(BANNER)
-        warn_power_save()
-
         self.tello.connect()
         self.tello.set_speed(self.speed)
         self.tello.streamoff()
         self.tello.streamon()
 
-        frame_read = self.tello.get_frame_read()
+        udp = ('udp://@0.0.0.0:11111'
+               '?overrun_nonfatal=1&fifo_size=500000&reuse=1')
+        frame_read = FFmpegFrameRead(udp).start()
 
         threading.Thread(target=self._battery_worker, daemon=True).start()
         threading.Thread(target=self._rc_worker, daemon=True).start()
-
-        # Diagnostic : affiche l'état du heartbeat 1×/seconde
-        last_diag = time.time()
-        last_count = 0
 
         should_stop = False
         while not should_stop:
@@ -144,32 +166,17 @@ class FrontEnd:
                 elif event.type == pygame.KEYUP:
                     self.keyup(event.key)
 
-            if frame_read.stopped:
-                break
-
-            # Diagnostic 1×/s — montre si le heartbeat tourne quand le drone se pose
-            now = time.time()
-            if now - last_diag >= 1.0:
-                rc_per_sec = self._rc_count - last_count
-                last_count = self._rc_count
-                last_diag = now
-                if self._takeoff_time:
-                    vol_t = int(now - self._takeoff_time)
-                    print(f"[vol {vol_t:>3}s] rc/s={rc_per_sec:>2}  "
-                          f"send_rc={self.send_rc_control}  bat={self._get_battery()}")
-
-            raw = frame_read.frame
-            if raw is None:
-                self.clock.tick(FPS)
-                continue
-
             self.screen.fill((0, 0, 0))
 
-            frame = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
-            frame = np.rot90(frame)
-            frame = np.flipud(frame)
-            surf = pygame.surfarray.make_surface(frame)
-            self.screen.blit(surf, (0, 0))
+            try:
+                raw = frame_read.frame
+                frame = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+                frame = np.rot90(frame)
+                frame = np.flipud(frame)
+                surf = pygame.surfarray.make_surface(frame)
+                self.screen.blit(surf, (0, 0))
+            except Exception:
+                pass  # flux vidéo temporairement indisponible — on continue
 
             bat_text = f"Batterie : {self._get_battery()}%"
             bat_surf = self.font.render(bat_text, True, (0, 255, 80))
@@ -190,6 +197,7 @@ class FrontEnd:
 
         self._stop_rc.set()
         self._stop_battery.set()
+        frame_read.stop()
         self.tello.end()
         pygame.quit()
 
@@ -227,18 +235,11 @@ class FrontEnd:
             threading.Thread(target=self._do_land, daemon=True).start()
 
     def _do_takeoff(self):
-        # Heartbeat armé AVANT le décollage → contrôle réactif dès l'envol.
-        # Note : le Tello ignore le rc pendant ~3-5s (routine de stabilisation
-        # interne du décollage) — ce court délai est normal et incompressible.
         self.send_rc_control = True
-        self._takeoff_time = time.time()
-        print("[TAKEOFF] décollage + stabilisation (~5s)...")
         self.tello.takeoff()
-        print("[TAKEOFF] terminé, contrôle manuel actif")
 
     def _do_land(self):
         self.send_rc_control = False
-        self._takeoff_time = None
         self.tello.land()
 
 
