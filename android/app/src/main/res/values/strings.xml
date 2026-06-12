@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tello Pilote</string>
+
+    <string name="connect">Connecter</string>
+    <string name="disconnect">Déconnecter</string>
+    <string name="takeoff">Décoller</string>
+    <string name="land">Atterrir</string>
+    <string name="emergency">URGENCE</string>
+
+    <string name="speed_slow">Lent</string>
+    <string name="speed_fast">Rapide</string>
+    <string name="flips_label">Flips :</string>
+    <string name="flip_forward">↑</string>
+    <string name="flip_back">↓</string>
+    <string name="flip_left">←</string>
+    <string name="flip_right">→</string>
+
+    <string name="telemetry_placeholder">Batterie -- • Haut. -- • Vol --</string>
+    <string name="telemetry_format">Batterie %1$d%% • Haut. %2$d cm • Vol %3$d s</string>
+
+    <string name="status_idle">1) Connectez le téléphone au Wi-Fi « TELLO-XXXXXX »\n2) Touchez « Connecter »</string>
+    <string name="status_binding">Liaison au réseau Wi-Fi…</string>
+    <string name="status_bind_failed">Wi-Fi introuvable — vérifiez la connexion au réseau TELLO</string>
+    <string name="status_connecting">Connexion au Tello…</string>
+    <string name="status_connected">Connecté au Tello ✔</string>
+    <string name="status_connect_failed">Le Tello ne répond pas — êtes-vous sur le Wi-Fi TELLO-XXXXXX ?</string>
+    <string name="status_video_failed">Vidéo indisponible (streamon refusé) — pilotage possible quand même</string>
+    <string name="status_emergency_hint">Appui LONG sur URGENCE pour couper les moteurs</string>
+</resources>
